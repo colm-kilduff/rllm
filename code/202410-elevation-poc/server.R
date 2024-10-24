@@ -10,7 +10,7 @@ library(leaflet.extras)
 
 ELEVATION_FILE_PATH <- 'data'
 
-elevation_files <- file.path(ELEVATION_FILE_PATH, list.files(ELEVATION_FILE_PATH))
+elevation_files <- file.path(ELEVATION_FILE_PATH, list.files(ELEVATION_FILE_PATH)) |> head(1)
 
 elevation_rasters <- lapply(elevation_files, raster)
 
@@ -55,8 +55,6 @@ server <- function(input, output, session) {
           smooth = TRUE
         )
       
-      # Add the final slope filtered to the global environment
-      assign("slope_filtered", slope_filtered, envir = globalenv())
     }
     
     # Add a legend
@@ -64,17 +62,11 @@ server <- function(input, output, session) {
       addLegend(
         pal = colorNumeric(
           palette = custom_palette,
-          domain = c(20, 80),
+          domain = c(20, 60),
           na.color = "transparent"
         ),
-        values = values(slope_filtered), 
+        values = c(20, 30, 40, 50, 60), 
         title = "Slope (Degrees)"
-      ) %>%
-      addDrawToolbar(
-        targetGroup = "drawn",
-        polygonOptions = drawPolygonOptions(showArea = TRUE),
-        circleOptions = FALSE,
-        editOptions = editToolbarOptions(selectedPathOptions = selectedPathOptions())
       ) %>%
       leaflet.extras::addSearchOSM(
         
