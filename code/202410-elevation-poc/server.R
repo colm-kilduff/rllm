@@ -7,10 +7,11 @@ library(shinyMobile)
 library(leafem)
 library(mapview)
 library(leaflet.extras)
+library(stars)
 
 ELEVATION_FILE_PATH <- 'data'
 
-elevation_files <- file.path(ELEVATION_FILE_PATH, list.files(ELEVATION_FILE_PATH)) |> head(1)
+elevation_files <- file.path(ELEVATION_FILE_PATH, list.files(ELEVATION_FILE_PATH))
 
 elevation_rasters <- lapply(elevation_files, raster)
 
@@ -21,7 +22,7 @@ slope_list <- lapply(elevation_rasters, function(r) {
 
 # Server definition 
 
-server <- function(input, output, session) {
+server <- function(input, output) {
   
   # Render the leaflet map
   output$slopeMap <- renderLeaflet({
@@ -69,10 +70,11 @@ server <- function(input, output, session) {
         title = "Slope (Degrees)"
       ) %>%
       leaflet.extras::addSearchOSM(
-        
       )
     
     # Return the final map
     map
   })
 }
+
+shinyApp(ui, server)
