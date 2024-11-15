@@ -2,7 +2,7 @@
 # population of businesses within Canada. 
 # We are using the ODBus dataset from 2023 to do this.
 library(tidyr)
-
+library(stringr)
 
 odbus <- read.csv(file.path(Sys.getenv('PROJ_DIR'), 'code', '202411-canadian-business-analysis/data/ODBus_v1/ODBus_v1.csv'))
 
@@ -38,3 +38,8 @@ odbus <-
   odbus |>
   left_join(naics_codes, by = c("derived_NAICS" = "code")) |>
   mutate(sector = ifelse(is.na(sector), 'Unknown', sector))
+
+
+odbus |> 
+  group_by(sector) |>
+  tally()
