@@ -1,12 +1,21 @@
-library(aws.s3); library(R.utils); library(data.table); library(dplyr); library(sf); library(ggplot2)
-WRITE_FROM_S3 <- FALSE
+library(aws.s3); library(R.utils); library(data.table); library(dplyr); library(sf); library(ggplot2); library(raster); library(stars); library(terra)
 PROJ_CRS <- 4326
+WRITE_INAT_FROM_S3 <- FALSE
 CREATE_CHANTERELLE_OBSERVATIONS <- FALSE
+READ_AND_WRITE_DOUGLAS_FIRS <- FALSE
+READ_AND_WRITE_BC_SHP <- FALSE
+READ_AND_WRITE_ELEVATION <- FALSE
+READ_AND_WRITE_LANDCOVER <- FALSE
 # In this analysis, we will be downloading the inaturalist observation and taxa datasets.
 # We will then filter for Pacific golden chanterelle (Cantherellus formosus).
 filter <- dplyr::filter
 
-if (WRITE_FROM_S3){
+bc_shp <-
+  st_read(file.path(Sys.getenv('PROJ_DIR'), 'code/202411-chanterelle-map/data/bc_shapefile.shp'))
+
+### Creation of datasets
+
+if (WRITE_INAT_FROM_S3){
   
   s3_bucket <- aws.s3::get_bucket('inaturalist-open-data')
   
@@ -23,15 +32,15 @@ if (WRITE_FROM_S3){
   
 }
 
-observations_csv <- file.path(Sys.getenv('PROJ_DIR'), "code", "202411-chanterelle-map", "data", "observations.csv")
-taxa_csv <- file.path(Sys.getenv('PROJ_DIR'), "code", "202411-chanterelle-map", "data", "taxa.csv")
-
-cantherellus_formosus_taxon <-
-  fread(taxa_csv) |>
-  dplyr::filter(name == 'Cantharellus formosus') |>
-  as_tibble()
-
 if (CREATE_CHANTERELLE_OBSERVATIONS){
+  
+  observations_csv <- file.path(Sys.getenv('PROJ_DIR'), "code", "202411-chanterelle-map", "data", "observations.csv")
+  taxa_csv <- file.path(Sys.getenv('PROJ_DIR'), "code", "202411-chanterelle-map", "data", "taxa.csv")
+  
+  cantherellus_formosus_taxon <-
+    fread(taxa_csv) |>
+    dplyr::filter(name == 'Cantharellus formosus') |>
+    as_tibble()
   
   chunk_size <- 10000000
   
@@ -84,6 +93,78 @@ if (CREATE_CHANTERELLE_OBSERVATIONS){
   
 }
 
+if (READ_AND_WRITE_BC_SHP){
+
+boundaries <- 
+  sf::st_read(file.path(Sys.getenv('PROJ_DIR'), 'code/202411-chanterelle-map/data/canvec_15M_CA_Admin/geo_political_region_2.shp'))
+
+bc_shp <-
+  boundaries |>
+  filter(juri_en == 'British Columbia') |>
+  summarise(geometry = st_union(geometry))
+
+bc_shp |>
+  st_write(file.path(Sys.getenv('PROJ_DIR'), 'code/202411-chanterelle-map/data/bc_shapefile.shp'))
+
+}
+
+if (READ_AND_WRITE_DOUGLAS_FIRS){
+  
+douglas_firs <- 
+  raster(file.path(Sys.getenv('PROJ_DIR'), 'code/202411-chanterelle-map/data/SCANFI_sps_douglasFir_SW_2020_v1.1.tif'))
+
+bc_douglas_firs <-
+  douglas_firs |> 
+  crop(bc_shp |> st_transform(st_crs(douglas_firs)))
+
+bc_douglas_firs |>
+  raster::writeRaster(file.path(Sys.getenv('PROJ_DIR'), 'code/202411-chanterelle-map/data/bc_douglas_fir_raster.tif'))
+
+}
+
+if (READ_AND_WRITE_ELEVATION){
+  
+  elevation_raster <- 
+    raster(file.path(Sys.getenv('PROJ_DIR'), 'code/202411-chanterelle-map/data/mrdem-30-dtm-hillshade.tif'))
+  
+  bc_shp_transformed <- 
+    bc_shp |>
+    st_transform(st_crs(elevation_raster))
+  
+  bc_elevation_raster <-
+    elevation_raster |>
+    crop(st_bbox(bc_shp_transformed)) |>
+    mask(bc_shp_transformed)
+  
+  bc_elevation_raster |>
+    raster::writeRaster(file.path(Sys.getenv('PROJ_DIR'), 'code/202411-chanterelle-map/data/bc_elevation_raster.tif'), overwrite = TRUE)
+  
+}
+
+if (READ_AND_WRITE_LANDCOVER){
+  
+  landcover_raster <-
+    raster(file.path(Sys.getenv('PROJ_DIR'), 'code/202411-chanterelle-map/data/SCANFI_att_nfiLandCover_SW_2020_v1.1.tif'))
+  
+  bc_shp_transformed <- 
+    bc_shp |>
+    st_transform(st_crs(landcover_raster))
+  
+  bc_landcover_raster_cropped <-
+    landcover_raster |>
+    crop(st_bbox(bc_shp_transformed))
+  
+  bc_landcover_masked <- 
+    bc_landcover_raster_cropped |>
+    mask(bc_shp_transformed)
+  
+  bc_landcover_masked |>
+    raster::writeRaster(file.path(Sys.getenv('PROJ_DIR'), 'code/202411-chanterelle-map/data/bc_landcover_raster.tif'))
+  
+}
+
+### Data Prep
+
 chanterelle_observations <- 
   read.csv('./code/202411-chanterelle-map/data/chanterelle_observations.csv') |>
   filter(!is.na(latitude), !is.na(longitude), quality_grade != 'needs_id') |>
@@ -91,11 +172,57 @@ chanterelle_observations <-
   st_as_sf(coords = c('longitude', 'latitude')) |>
   st_set_crs(4326)
 
-# plotting the observations
+bc_landcover <- stars::read_stars(file.path(Sys.getenv('PROJ_DIR'), 'code/202411-chanterelle-map/data/bc_landcover_raster.tif'))
 
-ggplot() +
-  # add a background map for this
-  geom_sf(data = chanterelle_observations)
+bc_elevation <- stars::read_stars(file.path(Sys.getenv('PROJ_DIR'), 'code/202411-chanterelle-map/data/bc_elevation_raster.tif'))
+
+### Chunking Landcover
+#
+# We need to chunk the landcover object into manageable pieces. We can deal with a maximum of maybe
+# 20 million cells at a time.
+
+dims <- dim(bc_landcover)
+
+# Calculate chunk size
+chunk_size <- 20000000 # 50 million cells
+total_cells <- prod(dims[1:2])
+num_chunks <- ceiling(total_cells / chunk_size)
+
+# Determine grid size
+rows_per_chunk <- ceiling(dims[1] / sqrt(num_chunks))
+cols_per_chunk <- ceiling(dims[2] / sqrt(num_chunks))
+
+start_x <- 1
+while (start_x <= dims[1]) {
+  start_y <- 1
+  while (start_y <= dims[2]) {
+    
+    # Determine chunk boundaries
+    end_x <- min(start_x + cols_per_chunk - 1, dims[1])
+    end_y <- min(start_y + rows_per_chunk - 1, dims[2])
+    
+    # Extract landcover chunk
+    landcover_chunk <- 
+      bc_landcover[start_x:end_x, start_y:end_y] |>
+      st_as_stars() |>
+      rename(landcover_id = bc_landcover_raster.tif)
+    
+    # Add elevation data to the chunk
+    landcover_chunk$elevation <- 
+      bc_elevation |>
+      st_warp(landcover_chunk) |>
+      rename(elevation = bc_elevation_raster.tif) |>
+      pull(elevation)
+    
+    # Advance start_y to next chunk
+    start_y <- start_y + rows_per_chunk
+  }
+  
+  # Advance start_x to next chunk
+  start_x <- start_x + cols_per_chunk
+}
+
+
 
 # Now we can read in the observations and taxa datasets.
 # We will use fread to first identify the row in taxa with Cantherellus formosus
@@ -121,7 +248,7 @@ ggplot() +
 # - Probability of occurence of mushrooms
 # - A computer vision model for mushroom identification
 # - The ability to save routes and mushroom locations
-# - application to be built using react most likely with inspiration
+# - application to be built using react native most likely with inspiration
 # from gaia gps
 # - Alerts to users based on weather patterns to go look for their chosen
 # mushrooms based on time of year and weather.
