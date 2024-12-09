@@ -1,5 +1,8 @@
-library(aws.s3); library(R.utils); library(data.table); library(dplyr); library(sf); library(ggplot2); library(raster); library(stars); library(terra)
+library(aws.s3); library(R.utils); library(data.table); library(dplyr); library(sf)
+library(ggplot2); library(raster); library(stars); library(terra); library(units)
+library(pROC)
 PROJ_CRS <- 4326
+OBS_BUFFER <- set_units(1000, 'm')
 WRITE_INAT_FROM_S3 <- FALSE
 CREATE_CHANTERELLE_OBSERVATIONS <- FALSE
 READ_AND_WRITE_DOUGLAS_FIRS <- FALSE
@@ -176,63 +179,122 @@ bc_landcover <- stars::read_stars(file.path(Sys.getenv('PROJ_DIR'), 'code/202411
 
 bc_elevation <- stars::read_stars(file.path(Sys.getenv('PROJ_DIR'), 'code/202411-chanterelle-map/data/bc_elevation_raster.tif'))
 
+bc_douglas_firs <- rast(file.path(Sys.getenv('PROJ_DIR'), 'code/202411-chanterelle-map/data/bc_douglas_fir_raster.tif'))
+
 ### Chunking Landcover
 #
 # We need to chunk the landcover object into manageable pieces. We can deal with a maximum of maybe
 # 20 million cells at a time.
 
-dims <- dim(bc_landcover)
 
-# Calculate chunk size
-chunk_size <- 20000000 # 50 million cells
-total_cells <- prod(dims[1:2])
-num_chunks <- ceiling(total_cells / chunk_size)
+chanterelle_observations_buffer <-
+  chanterelle_observations |>
+  st_join(bc_shp |>
+            st_transform(PROJ_CRS),
+          join = st_intersects,
+          left = FALSE) |>
+  st_buffer(OBS_BUFFER)
 
-# Determine grid size
-rows_per_chunk <- ceiling(dims[1] / sqrt(num_chunks))
-cols_per_chunk <- ceiling(dims[2] / sqrt(num_chunks))
+ITERATION <- 1
+list_of_combined_buffers <- list()
 
-start_x <- 1
-while (start_x <= dims[1]) {
-  start_y <- 1
-  while (start_y <= dims[2]) {
-    
-    # Determine chunk boundaries
-    end_x <- min(start_x + cols_per_chunk - 1, dims[1])
-    end_y <- min(start_y + rows_per_chunk - 1, dims[2])
-    
-    # Extract landcover chunk
-    landcover_chunk <- 
-      bc_landcover[start_x:end_x, start_y:end_y] |>
-      st_as_stars() |>
-      rename(landcover_id = bc_landcover_raster.tif)
-    
-    # Add elevation data to the chunk
-    landcover_chunk$elevation <- 
-      bc_elevation |>
-      st_warp(landcover_chunk) |>
-      rename(elevation = bc_elevation_raster.tif) |>
-      pull(elevation)
-    
-    # Advance start_y to next chunk
-    start_y <- start_y + rows_per_chunk
-  }
+while(ITERATION <= nrow(chanterelle_observations_buffer)){
   
-  # Advance start_x to next chunk
-  start_x <- start_x + cols_per_chunk
+  chanterelle_buffer_iteration <-
+    chanterelle_observations_buffer |>
+    filter(row_number() == ITERATION) |>
+    st_transform(st_crs(bc_elevation))
+
+  cropped_elevation <- 
+    rast(bc_elevation) |>
+    crop(st_bbox(chanterelle_buffer_iteration)) |>
+    mask(chanterelle_buffer_iteration) |>
+    st_as_stars() |>
+    st_transform(PROJ_CRS)
+
+  cropped_landcover <-
+    rast(bc_landcover) |>
+    crop(st_bbox(chanterelle_buffer_iteration |> 
+                   st_transform(
+                     st_crs(bc_landcover)
+                     )
+                 )
+         ) |>
+    mask(chanterelle_buffer_iteration |>
+           st_transform(
+             st_crs(bc_landcover)
+           )) |>
+    st_as_stars() |>
+    st_transform(PROJ_CRS) |>
+    st_warp(cropped_elevation)
+  
+  cropped_bc_douglas_firs <-
+    bc_douglas_firs |>
+    crop(st_bbox(chanterelle_buffer_iteration |>
+                   st_transform(
+                     st_crs(bc_douglas_firs)
+                   )
+                 )
+         ) |>
+    mask(chanterelle_buffer_iteration |>
+           st_transform(
+             st_crs(bc_douglas_firs)
+           )
+    ) |>
+    st_as_stars() |>
+    st_transform(PROJ_CRS) |>
+    st_warp(cropped_elevation)
+  
+  combined_raster <- c(cropped_elevation, cropped_landcover, cropped_bc_douglas_firs)
+  
+  names(combined_raster) <- c("elevation", "land_cover", "douglas_firs")
+  
+  combined_raster <- st_as_sf(combined_raster)
+  
+  list_of_combined_buffers[[length(list_of_combined_buffers) + 1]] <- combined_raster
+
+  ITERATION <- ITERATION + 1
+  
 }
 
+combined_buffer <- 
+  do.call(rbind, list_of_combined_buffers) |>
+  distinct()
 
+chanterelle_df <-
+  combined_buffer |> 
+  st_join(chanterelle_observations |> 
+            st_transform(PROJ_CRS),
+          join = st_intersects, 
+          left = TRUE) |> 
+  st_drop_geometry()  |>
+  mutate(is_chanterelle = !is.na(observation_uuid))
+
+chanterelle_df |>
+  group_by(is_chanterelle) |>
+  summarise(mean(elevation, na.rm = T), mean(land_cover, na.rm = T), mean(douglas_firs, na.rm =T))
 
 # Now we can read in the observations and taxa datasets.
 # We will use fread to first identify the row in taxa with Cantherellus formosus
-
-#TODO: Get and read in elevation data
-#TOOD: Download and read in NRCAN dataset
-#TODO: Download and read in BC shapefile.
+#TODO: Join in variable chanterelle observations to the dataset. 
+#TODO: Figure out I will model it with such a low amount of observations relative to data points.
 #TODO: Intersect all datasets and model using a gam with a thin-plate spline on lat long
 #TODO: Use leaflet to visualise the model.
 #TODO: Download and read in the BC crown land map
+
+
+### Modelling
+
+chanterelle_model_1 <- glm(is_chanterelle ~ elevation*as.factor(land_cover)*douglas_firs, data = chanterelle_df)
+
+chanterelle_model_1 |>
+  summary()
+
+chanterelle_df$prediction_1 <- predict(chanterelle_model_1, newdata = chanterelle_df)
+
+roc(chanterelle_df$is_chanterelle, chanterelle_df$prediction_1) |>
+  auc()
+
 
 #This is to do work on a map of chanterelle locations in BC - the outcome of this will be a
 #Model of chanterelle locations in BC
@@ -267,3 +329,12 @@ while (start_x <= dims[1]) {
 # 89 for the year vs 20 a month.
 
 
+# Below we plot the chanterrelle observations in BC
+ggplot() + 
+  geom_sf(data = bc_shp) + 
+  geom_sf(data = chanterelle_observations |>
+            st_transform(st_crs(bc_shp)) |>
+            st_join(bc_shp, 
+                    left = FALSE, 
+                    join = st_intersects)
+          )
