@@ -9,6 +9,7 @@ READ_AND_WRITE_DOUGLAS_FIRS <- FALSE
 READ_AND_WRITE_BC_SHP <- FALSE
 READ_AND_WRITE_ELEVATION <- FALSE
 READ_AND_WRITE_LANDCOVER <- FALSE
+WRITE_COMBINED_BUFFER <- FALSE
 # In this analysis, we will be downloading the inaturalist observation and taxa datasets.
 # We will then filter for Pacific golden chanterelle (Cantherellus formosus).
 filter <- dplyr::filter
@@ -181,6 +182,9 @@ bc_elevation <- stars::read_stars(file.path(Sys.getenv('PROJ_DIR'), 'code/202411
 
 bc_douglas_firs <- rast(file.path(Sys.getenv('PROJ_DIR'), 'code/202411-chanterelle-map/data/bc_douglas_fir_raster.tif'))
 
+soil_parent_materials <- 
+  rast(file.path(Sys.getenv('PROJ_DIR'), "code", "202411-chanterelle-map", "data", "soil_parent_materials", "HaBC_PM.tif"))
+
 ### Chunking Landcover
 #
 # We need to chunk the landcover object into manageable pieces. We can deal with a maximum of maybe
@@ -209,6 +213,22 @@ while(ITERATION <= nrow(chanterelle_observations_buffer)){
     rast(bc_elevation) |>
     crop(st_bbox(chanterelle_buffer_iteration)) |>
     mask(chanterelle_buffer_iteration) |>
+    st_as_stars() |>
+    st_transform(PROJ_CRS)
+  
+  cropped_slope <-
+    rast(bc_elevation) |>
+    crop(st_bbox(chanterelle_buffer_iteration)) |>
+    mask(chanterelle_buffer_iteration) |>
+    terrain(v = "slope", unit = 'degrees') |>
+    st_as_stars() |>
+    st_transform(PROJ_CRS)
+  
+  cropped_aspect <-
+    rast(bc_elevation) |>
+    crop(st_bbox(chanterelle_buffer_iteration)) |>
+    mask(chanterelle_buffer_iteration) |>
+    terrain(v = "aspect", unit = 'degrees') |>
     st_as_stars() |>
     st_transform(PROJ_CRS)
 
@@ -245,9 +265,26 @@ while(ITERATION <= nrow(chanterelle_observations_buffer)){
     st_transform(PROJ_CRS) |>
     st_warp(cropped_elevation)
   
-  combined_raster <- c(cropped_elevation, cropped_landcover, cropped_bc_douglas_firs)
+  cropped_soil <-
+    soil_parent_materials |>
+    crop(st_bbox(chanterelle_buffer_iteration |>
+                   st_transform(
+                     st_crs(soil_parent_materials)
+                   )
+    )
+    ) |>
+    mask(chanterelle_buffer_iteration |>
+           st_transform(
+             st_crs(soil_parent_materials)
+           )
+    ) |>
+    st_as_stars() |>
+    st_transform(PROJ_CRS) |>
+    st_warp(cropped_elevation)
   
-  names(combined_raster) <- c("elevation", "land_cover", "douglas_firs")
+  combined_raster <- c(cropped_elevation, cropped_slope, cropped_aspect, cropped_landcover, cropped_bc_douglas_firs, cropped_soil)
+  
+  names(combined_raster) <- c("elevation", "slope", "aspect", "land_cover", "douglas_firs", "soil_class")
   
   combined_raster <- st_as_sf(combined_raster)
   
@@ -261,6 +298,14 @@ combined_buffer <-
   do.call(rbind, list_of_combined_buffers) |>
   distinct()
 
+if (WRITE_COMBINED_BUFFER){
+  
+  combined_buffer |>
+    write_rds(file.path(Sys.getenv('PROJ_DIR'), 'code/202411-chanterelle-map/data/combined_buffer.rds'))
+  
+  
+}
+
 chanterelle_df <-
   combined_buffer |> 
   st_join(chanterelle_observations |> 
@@ -270,9 +315,23 @@ chanterelle_df <-
   st_drop_geometry()  |>
   mutate(is_chanterelle = !is.na(observation_uuid))
 
+set.seed(123)
+
+chanterelle_df <- 
+  chanterelle_df |>
+  # There are too few observations of soil class 14
+  mutate(soil_class = ifelse(soil_class == 14, 11, soil_class),
+         slope_cut = cut(slope, breaks = c(10, 20, 30, 40, 50, 60))
+         ) |>
+  group_by(soil_class) |>
+  mutate(sample = sample(c("TRAIN", "TEST"), size = n(), replace = TRUE, prob = c(0.7, 0.3)),
+         ) |>
+  # removing NAs for simplicity
+  filter(!is.na(elevation), !is.na(slope), !is.na(aspect), !is.na(land_cover), !is.na(douglas_firs), !is.na(soil_class))
+
 chanterelle_df |>
   group_by(is_chanterelle) |>
-  summarise(mean(elevation, na.rm = T), mean(land_cover, na.rm = T), mean(douglas_firs, na.rm =T))
+  summarise(n(), mean(elevation, na.rm = T), mean(land_cover, na.rm = T), mean(douglas_firs, na.rm =T))
 
 # Now we can read in the observations and taxa datasets.
 # We will use fread to first identify the row in taxa with Cantherellus formosus
@@ -285,16 +344,54 @@ chanterelle_df |>
 
 ### Modelling
 
-chanterelle_model_1 <- glm(is_chanterelle ~ elevation*as.factor(land_cover)*douglas_firs, data = chanterelle_df)
+chanterelle_model_1 <- glm(is_chanterelle ~ elevation + as.factor(land_cover) + douglas_firs, data = chanterelle_df |> filter(sample == 'TRAIN'), family = 'binomial')
 
 chanterelle_model_1 |>
   summary()
 
-chanterelle_df$prediction_1 <- predict(chanterelle_model_1, newdata = chanterelle_df)
+chanterelle_df$prediction_1 <- predict(chanterelle_model_1, newdata = chanterelle_df, type = 'response')
 
 roc(chanterelle_df$is_chanterelle, chanterelle_df$prediction_1) |>
   auc()
 
+
+# Next we will add in the soil type.
+
+chanterelle_model_2 <- glm(is_chanterelle ~ elevation + as.factor(land_cover) + douglas_firs + as.factor(soil_class), data = chanterelle_df |> filter(sample == 'TRAIN'), family = 'binomial')
+
+chanterelle_model_2 |>
+  summary()
+
+chanterelle_df$prediction_2 <- predict(chanterelle_model_2, newdata = chanterelle_df, type = 'response')
+
+roc(chanterelle_df$is_chanterelle, chanterelle_df$prediction_2) |>
+  auc()
+
+# Now we will add slope.
+
+chanterelle_model_3 <- glm(is_chanterelle ~ elevation + as.factor(land_cover) + douglas_firs + as.factor(soil_class) + slope, data = chanterelle_df |> filter(sample == 'TRAIN'), family = 'binomial')
+
+chanterelle_model_3 |>
+  summary()
+
+chanterelle_df$prediction_3 <- predict(chanterelle_model_3, newdata = chanterelle_df, type = 'response')
+
+roc(chanterelle_df$is_chanterelle, chanterelle_df$prediction_3) |>
+  auc()
+
+# Next we try a cut variable on slope.
+
+chanterelle_model_4 <- glm(is_chanterelle ~ elevation + as.factor(land_cover) + douglas_firs + as.factor(soil_class) + slope_cut, data = chanterelle_df |> filter(sample == 'TRAIN'), family = 'binomial')
+
+chanterelle_model_4 |>
+  summary()
+
+chanterelle_df$prediction_4 <- predict(chanterelle_model_4, newdata = chanterelle_df, type = 'response')
+
+roc(chanterelle_df$is_chanterelle, chanterelle_df$prediction_4) |>
+  auc()
+
+#TODO: try out slope, crown cover, 
 
 #This is to do work on a map of chanterelle locations in BC - the outcome of this will be a
 #Model of chanterelle locations in BC
@@ -332,9 +429,5 @@ roc(chanterelle_df$is_chanterelle, chanterelle_df$prediction_1) |>
 # Below we plot the chanterrelle observations in BC
 ggplot() + 
   geom_sf(data = bc_shp) + 
-  geom_sf(data = chanterelle_observations |>
-            st_transform(st_crs(bc_shp)) |>
-            st_join(bc_shp, 
-                    left = FALSE, 
-                    join = st_intersects)
+  geom_sf(data = chanterelle_df
           )
