@@ -391,6 +391,20 @@ chanterelle_df$prediction_4 <- predict(chanterelle_model_4, newdata = chanterell
 roc(chanterelle_df$is_chanterelle, chanterelle_df$prediction_4) |>
   auc()
 
+# Trying out aspect
+
+chanterelle_model_5 <- glm(is_chanterelle ~ elevation + as.factor(land_cover) + douglas_firs + as.factor(soil_class) + slope + aspect, data = chanterelle_df |> filter(sample == 'TRAIN'), family = 'binomial')
+
+chanterelle_model_5 |>
+  summary()
+
+chanterelle_df$prediction_5 <- predict(chanterelle_model_5, newdata = chanterelle_df, type = 'response')
+
+roc(chanterelle_df$is_chanterelle, chanterelle_df$prediction_5) |>
+  auc()
+
+
+
 #TODO: try out slope, crown cover, 
 
 #This is to do work on a map of chanterelle locations in BC - the outcome of this will be a
