@@ -1,6 +1,7 @@
+# source(file.path(Sys.getenv('PROJ_DIR'), 'code/202411-chanterelle-map/202411-chanterelle-map.R'))
 library(aws.s3); library(R.utils); library(data.table); library(dplyr); library(sf)
 library(ggplot2); library(raster); library(stars); library(terra); library(units)
-library(pROC)
+library(pROC); library(mgcv)
 PROJ_CRS <- 4326
 OBS_BUFFER <- set_units(1000, 'm')
 WRITE_INAT_FROM_S3 <- FALSE
@@ -199,6 +200,9 @@ chanterelle_observations_buffer <-
           left = FALSE) |>
   st_buffer(OBS_BUFFER)
 
+
+if (WRITE_COMBINED_BUFFER){
+
 ITERATION <- 1
 list_of_combined_buffers <- list()
 
@@ -297,14 +301,19 @@ while(ITERATION <= nrow(chanterelle_observations_buffer)){
 combined_buffer <- 
   do.call(rbind, list_of_combined_buffers) |>
   distinct()
-
-if (WRITE_COMBINED_BUFFER){
   
   combined_buffer |>
     write_rds(file.path(Sys.getenv('PROJ_DIR'), 'code/202411-chanterelle-map/data/combined_buffer.rds'))
   
   
+} else {
+  
+  combined_buffer <- 
+    read_rds(file.path(Sys.getenv('PROJ_DIR'), 'code/202411-chanterelle-map/data/combined_buffer.rds'))
+  
 }
+
+
 
 chanterelle_df <-
   combined_buffer |> 
@@ -321,17 +330,43 @@ chanterelle_df <-
   chanterelle_df |>
   # There are too few observations of soil class 14
   mutate(soil_class = ifelse(soil_class == 14, 11, soil_class),
-         slope_cut = cut(slope, breaks = c(10, 20, 30, 40, 50, 60))
+         soil_class_grouping = case_when(
+           soil_class == 2 ~ "Human-Induced",
+           soil_class == 3 ~ "Gravity-Induced",
+           soil_class == 4 ~ "Weathering-Induced",
+           soil_class == 5 ~ "Wind-Induced",
+           soil_class %in% c(6, 7, 9, 10, 16, 17, 18) ~ "Water-Induced",
+           soil_class %in% c(8, 11) ~ "Ice-Induced",
+           soil_class == 12 ~ "Organic",
+           soil_class == 13 ~ "Rock",
+           soil_class == 14 ~ "Undifferentiated",
+           soil_class == 15 ~ "Volcanic"
+         ),
+         soil_class_grouping_b = case_when(soil_class %in% c(16, 17) ~ "16&17",
+                                     soil_class %in% c(10, 7) ~ "10&7",
+                                     T ~ 'Rest of soils'),
+         slope_cut = cut(slope, breaks = c(-0.00000001, 10, 20, 30, 40, 50, 60, 90)),
+         land_cover = case_when(
+           land_cover == 1 ~ "Bryoid",
+           land_cover == 2 ~ "Herbs",
+           land_cover == 3 ~ "Rock",
+           land_cover == 4 ~ "Shrub",
+           land_cover == 5 ~ "Treed broadleaf",
+           land_cover == 6 ~ "Treed conifer",
+           land_cover == 7 ~ "Treed mixed",
+           land_cover == 8 ~ "a_Water"
+         ),
+         land_cover_grouping = case_when(land_cover == "Treed conifer" ~ "Treed conifer",
+                                         land_cover == "Treed mixed" ~ "Treed mixed",
+                                         land_cover == "Treed broadleaf" ~ "Treed broadleaf",
+                                         T ~ 'Rest of land covers'),
          ) |>
   group_by(soil_class) |>
   mutate(sample = sample(c("TRAIN", "TEST"), size = n(), replace = TRUE, prob = c(0.7, 0.3)),
          ) |>
   # removing NAs for simplicity
-  filter(!is.na(elevation), !is.na(slope), !is.na(aspect), !is.na(land_cover), !is.na(douglas_firs), !is.na(soil_class))
-
-chanterelle_df |>
-  group_by(is_chanterelle) |>
-  summarise(n(), mean(elevation, na.rm = T), mean(land_cover, na.rm = T), mean(douglas_firs, na.rm =T))
+  filter(!is.na(elevation), !is.na(slope), !is.na(aspect), !is.na(land_cover), !is.na(douglas_firs), !is.na(soil_class)) |>
+  ungroup()
 
 # Now we can read in the observations and taxa datasets.
 # We will use fread to first identify the row in taxa with Cantherellus formosus
@@ -341,43 +376,172 @@ chanterelle_df |>
 #TODO: Use leaflet to visualise the model.
 #TODO: Download and read in the BC crown land map
 
+### Analysis
+#
+# In this section we will be doing some data exploration for variables in the model.
+# 
+# We check out landcover.
+
+chanterelle_df |>
+  filter(sample == 'TRAIN') |>
+  group_by(land_cover) |>
+  summarise(n = n(), chanterelle_rate = mean(is_chanterelle)) |>
+  arrange(desc(chanterelle_rate))
+
+# We checkout soil.
+
+chanterelle_df |>
+  filter(sample == 'TRAIN') |>
+  group_by(soil_class) |>
+  summarise(n = n(), chanterelle_rate = mean(is_chanterelle)) |>
+  arrange(desc(chanterelle_rate))
+
+# Below is the soil type legend 
+#
+# 2	Anthroprogenic
+# 3	Colluvium
+# 4	Weathered Bedrock
+# 5	Eolian
+# 6	Fluvial
+# 7	Glaciofluvial
+# 8	Ice
+# 9	Lacustrine
+# 10	Glaciolacustrine
+# 11	Till
+# 12	Organic
+# 13	Rock
+# 14	Undifferentiated
+# 15	Volcanic
+# 16	Marine
+# 17	Glaciomarine
+# 18	Water
+
 
 ### Modelling
 
-chanterelle_model_1 <- glm(is_chanterelle ~ elevation + as.factor(land_cover) + douglas_firs, data = chanterelle_df |> filter(sample == 'TRAIN'), family = 'binomial')
+auc_by_group <- function(data, response_var, prediction_var, ...){
+  
+  group_vars <- quos(...)
+  response <- enquo(response_var)
+  prediction <- enquo(prediction_var)
+  
+  # Group data if grouping variables are provided
+  data %>%
+    group_by(!!!group_vars) %>%
+    summarise(
+      auc_value = as.numeric(auc(roc(!!response, !!prediction, quiet = TRUE))), 
+      .groups = "drop"
+    )
+}
+
+chanterelle_model_1 <- glm(is_chanterelle ~ elevation, data = chanterelle_df |> filter(sample == 'TRAIN'), family = 'binomial')
 
 chanterelle_model_1 |>
   summary()
 
 chanterelle_df$prediction_1 <- predict(chanterelle_model_1, newdata = chanterelle_df, type = 'response')
 
-roc(chanterelle_df$is_chanterelle, chanterelle_df$prediction_1) |>
-  auc()
+chanterelle_df |>
+  auc_by_group(is_chanterelle, prediction_1, sample)
 
 
-# Next we will add in the soil type.
+# Just slightly better than random.
+#Next we will add land cover class
 
-chanterelle_model_2 <- glm(is_chanterelle ~ elevation + as.factor(land_cover) + douglas_firs + as.factor(soil_class), data = chanterelle_df |> filter(sample == 'TRAIN'), family = 'binomial')
+chanterelle_model_2 <- glm(is_chanterelle ~ elevation + as.factor(land_cover), data = chanterelle_df |> filter(sample == 'TRAIN'), family = 'binomial')
 
 chanterelle_model_2 |>
   summary()
 
 chanterelle_df$prediction_2 <- predict(chanterelle_model_2, newdata = chanterelle_df, type = 'response')
 
-roc(chanterelle_df$is_chanterelle, chanterelle_df$prediction_2) |>
-  auc()
+chanterelle_df |>
+  auc_by_group(is_chanterelle, prediction_2, sample)
 
-# Now we will add slope.
 
-chanterelle_model_3 <- glm(is_chanterelle ~ elevation + as.factor(land_cover) + douglas_firs + as.factor(soil_class) + slope, data = chanterelle_df |> filter(sample == 'TRAIN'), family = 'binomial')
+# Most of the levels of the land cover are insignificant so we will try out land cover groupings.
+
+chanterelle_model_3 <- glm(is_chanterelle ~ elevation + land_cover_grouping, data = chanterelle_df |> filter(sample == 'TRAIN'), family = 'binomial')
 
 chanterelle_model_3 |>
   summary()
 
 chanterelle_df$prediction_3 <- predict(chanterelle_model_3, newdata = chanterelle_df, type = 'response')
 
-roc(chanterelle_df$is_chanterelle, chanterelle_df$prediction_3) |>
-  auc()
+chanterelle_df |>
+  auc_by_group(is_chanterelle, prediction_3, sample)
+
+# Although 2 of the levels are insignificant they rank well so we will keep them.
+
+# Next we will add % of crown cover that is douglas fir.
+
+
+chanterelle_model_4 <- glm(is_chanterelle ~ elevation + land_cover_grouping + douglas_firs, data = chanterelle_df |> filter(sample == 'TRAIN'), family = 'binomial')
+
+chanterelle_model_4 |>
+  summary()
+
+chanterelle_df$prediction_4 <- predict(chanterelle_model_4, newdata = chanterelle_df, type = 'response')
+
+chanterelle_df |>
+  auc_by_group(is_chanterelle, prediction_4, sample)
+
+# Again, the variable is not significant but because it improves fit and makes logical sense, 
+# we will keep it in the model. The test auc jumped up significantly from the douglas fir variable.
+#
+# Next we will add in the soil type.
+
+chanterelle_model_5 <- glm(is_chanterelle ~ elevation + land_cover_grouping + douglas_firs + as.factor(soil_class), data = chanterelle_df |> filter(sample == 'TRAIN'), family = 'binomial')
+
+chanterelle_model_5 |>
+  summary()
+
+chanterelle_df$prediction_5 <- predict(chanterelle_model_5, newdata = chanterelle_df, type = 'response')
+
+chanterelle_df |>
+  auc_by_group(is_chanterelle, prediction_5, sample)
+
+# This results in some overfitting so we will try the soil grouping instead.
+
+chanterelle_model_6 <- glm(is_chanterelle ~  elevation + land_cover_grouping + douglas_firs + soil_class_grouping, data = chanterelle_df |> filter(sample == 'TRAIN'), family = 'binomial')
+
+chanterelle_model_6 |>
+  summary()
+
+chanterelle_df$prediction_6 <- predict(chanterelle_model_6, newdata = chanterelle_df, type = 'response')
+
+chanterelle_df |>
+  auc_by_group(is_chanterelle, prediction_6, sample)
+
+# The regular soil class by itself is thus far the best.
+# We will try a simplified version of the soil grouping.
+
+chanterelle_model_7 <- glm(is_chanterelle ~  elevation + land_cover_grouping + douglas_firs + soil_class_grouping_b, data = chanterelle_df |> filter(sample == 'TRAIN'), family = 'binomial')
+
+chanterelle_model_7 |>
+  summary()
+
+chanterelle_df$prediction_7 <- predict(chanterelle_model_7, newdata = chanterelle_df, type = 'response')
+
+chanterelle_df |>
+  auc_by_group(is_chanterelle, prediction_7, sample)
+
+# This is worse again, we will keep the soil class
+# Now we will add slope.
+
+chanterelle_model_8 <- glm(is_chanterelle ~ elevation + as.factor(land_cover) + douglas_firs + as.factor(soil_class) + slope, data = chanterelle_df |> filter(sample == 'TRAIN'), family = 'binomial')
+
+chanterelle_model_8 |>
+  summary()
+
+chanterelle_df$prediction_8 <- predict(chanterelle_model_8, newdata = chanterelle_df, type = 'response')
+
+chanterelle_df |>
+  auc_by_group(is_chanterelle, prediction_8, sample)
+
+# There is a big jump in slope for the train AUC and a minor jump in test AUC.
+
+stop('TO HERE')
 
 # Next we try a cut variable on slope.
 
@@ -388,8 +552,8 @@ chanterelle_model_4 |>
 
 chanterelle_df$prediction_4 <- predict(chanterelle_model_4, newdata = chanterelle_df, type = 'response')
 
-roc(chanterelle_df$is_chanterelle, chanterelle_df$prediction_4) |>
-  auc()
+chanterelle_df |>
+  auc_by_group(is_chanterelle, prediction_4, sample)
 
 # Trying out aspect
 
@@ -399,13 +563,24 @@ chanterelle_model_5 |>
   summary()
 
 chanterelle_df$prediction_5 <- predict(chanterelle_model_5, newdata = chanterelle_df, type = 'response')
+  
+chanterelle_df |>
+  auc_by_group(is_chanterelle, prediction_5, sample)
 
-roc(chanterelle_df$is_chanterelle, chanterelle_df$prediction_5) |>
-  auc()
+# We do not believe that a GLM is the best type of model for this. We would ideally
+# like a model that can have non-linear effects. We will try out a gam model first.
+# In particular, slope seems to be non-linear, aspect we would expect to be non-linear.
 
+chanterelle_model_6 <- gam(is_chanterelle ~ s(elevation) + as.factor(land_cover) + douglas_firs + as.factor(soil_class) + slope + s(aspect), data = chanterelle_df |> filter(sample == 'TRAIN'), family = 'binomial')
 
+chanterelle_model_6 |>
+  summary()
 
-#TODO: try out slope, crown cover, 
+chanterelle_df$prediction_6 <- predict(chanterelle_model_6, newdata = chanterelle_df, type = 'response')
+
+chanterelle_df |>
+  auc_by_group(is_chanterelle, prediction_6, sample)
+
 
 #This is to do work on a map of chanterelle locations in BC - the outcome of this will be a
 #Model of chanterelle locations in BC
