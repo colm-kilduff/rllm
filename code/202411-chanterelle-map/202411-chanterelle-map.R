@@ -11,6 +11,7 @@ READ_AND_WRITE_BC_SHP <- FALSE
 READ_AND_WRITE_ELEVATION <- FALSE
 READ_AND_WRITE_LANDCOVER <- FALSE
 WRITE_COMBINED_BUFFER <- FALSE
+READ_AND_WRITE_VFI <- FALSE
 # In this analysis, we will be downloading the inaturalist observation and taxa datasets.
 # We will then filter for Pacific golden chanterelle (Cantherellus formosus).
 filter <- dplyr::filter
@@ -165,6 +166,12 @@ if (READ_AND_WRITE_LANDCOVER){
   
   bc_landcover_masked |>
     raster::writeRaster(file.path(Sys.getenv('PROJ_DIR'), 'code/202411-chanterelle-map/data/bc_landcover_raster.tif'))
+  
+}
+
+if (READ_AND_WRITE_VFI){
+  
+  vfi <- st_read(file.path(Sys.getenv('PROJ_DIR'), 'code/202411-chanterelle-map/data/vfi_2023/VEG_COMP_LYR_R1_POLY_2023.gdb'))
   
 }
 
@@ -543,6 +550,7 @@ chanterelle_df |>
 
 stop('TO HERE')
 
+#TODO: Do something with slope to reduce the overfit it introduces
 # Next we try a cut variable on slope.
 
 chanterelle_model_4 <- glm(is_chanterelle ~ elevation + as.factor(land_cover) + douglas_firs + as.factor(soil_class) + slope_cut, data = chanterelle_df |> filter(sample == 'TRAIN'), family = 'binomial')
