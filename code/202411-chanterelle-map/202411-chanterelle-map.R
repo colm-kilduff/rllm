@@ -169,20 +169,57 @@ if (READ_AND_WRITE_LANDCOVER){
   
 }
 
-if (READ_AND_WRITE_VFI){
-  
-  vfi <- st_read(file.path(Sys.getenv('PROJ_DIR'), 'code/202411-chanterelle-map/data/vfi_2023/VEG_COMP_LYR_R1_POLY_2023.gdb'))
-  
-}
-
-### Data Prep
-
 chanterelle_observations <- 
   read.csv('./code/202411-chanterelle-map/data/chanterelle_observations.csv') |>
   filter(!is.na(latitude), !is.na(longitude), quality_grade != 'needs_id') |>
   as_tibble() |>
   st_as_sf(coords = c('longitude', 'latitude')) |>
   st_set_crs(4326)
+
+chanterelle_observations_buffer <-
+  chanterelle_observations |>
+  st_join(bc_shp |>
+            st_transform(PROJ_CRS),
+          join = st_intersects,
+          left = FALSE) |>
+  st_buffer(OBS_BUFFER)
+
+# Making the VFI dataset useable.
+
+if (READ_AND_WRITE_VFI){
+  
+  gdb_path <- file.path(Sys.getenv('PROJ_DIR'), 'code/202411-chanterelle-map/data/vfi_2023/VEG_COMP_LYR_R1_POLY_2023.gdb')
+  
+  query <- 
+    "SELECT 
+    PROJ_AGE_1, 
+    PROJ_AGE_2, 
+    PROJ_HEIGHT_1, 
+    PROJ_HEIGHT_2, 
+    WHOLE_STEM_BIOMASS_PER_HA, 
+    BRANCH_BIOMASS_PER_HA, 
+    SOIL_MOISTURE_REGIME_1, 
+    SOIL_MOISTURE_REGIME_2, 
+    SOIL_NUTRIENT_REGIME, 
+    HERB_COVER_PCT, 
+    BRYOID_COVER_PCT, 
+    SPECIES_CD_1, 
+    SPECIES_CD_2, 
+    SPECIES_CD_3, 
+    CROWN_CLOSURE, 
+    VERTICAL_COMPLEXITY, 
+    BEC_ZONE_CODE, 
+    BEC_SUBZONE, 
+    Shape
+  FROM VEG_COMP_LYR_R1_POLY
+  LIMIT 1000000 OFFSET 0"
+  
+  vfi <- st_read(gdb_path, query = query)
+  
+}
+
+
+### Data Prep
 
 bc_landcover <- stars::read_stars(file.path(Sys.getenv('PROJ_DIR'), 'code/202411-chanterelle-map/data/bc_landcover_raster.tif'))
 
@@ -197,15 +234,6 @@ soil_parent_materials <-
 #
 # We need to chunk the landcover object into manageable pieces. We can deal with a maximum of maybe
 # 20 million cells at a time.
-
-
-chanterelle_observations_buffer <-
-  chanterelle_observations |>
-  st_join(bc_shp |>
-            st_transform(PROJ_CRS),
-          join = st_intersects,
-          left = FALSE) |>
-  st_buffer(OBS_BUFFER)
 
 
 if (WRITE_COMBINED_BUFFER){
