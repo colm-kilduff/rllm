@@ -188,33 +188,82 @@ chanterelle_observations_buffer <-
 
 if (READ_AND_WRITE_VFI){
   
+  # TODO: finish data prep for vfi
+  
   gdb_path <- file.path(Sys.getenv('PROJ_DIR'), 'code/202411-chanterelle-map/data/vfi_2023/VEG_COMP_LYR_R1_POLY_2023.gdb')
   
-  query <- 
-    "SELECT 
-    PROJ_AGE_1, 
-    PROJ_AGE_2, 
-    PROJ_HEIGHT_1, 
-    PROJ_HEIGHT_2, 
-    WHOLE_STEM_BIOMASS_PER_HA, 
-    BRANCH_BIOMASS_PER_HA, 
-    SOIL_MOISTURE_REGIME_1, 
-    SOIL_MOISTURE_REGIME_2, 
-    SOIL_NUTRIENT_REGIME, 
-    HERB_COVER_PCT, 
-    BRYOID_COVER_PCT, 
-    SPECIES_CD_1, 
-    SPECIES_CD_2, 
-    SPECIES_CD_3, 
-    CROWN_CLOSURE, 
-    VERTICAL_COMPLEXITY, 
-    BEC_ZONE_CODE, 
-    BEC_SUBZONE, 
-    Shape
-  FROM VEG_COMP_LYR_R1_POLY
-  LIMIT 1000000 OFFSET 0"
+  VFI_CHUNK_SIZE <- as.integer(1000000)
+  VFI_ROW_START <- 0
   
-  vfi <- st_read(gdb_path, query = query)
+  veg_count <-
+    st_read(
+    gdb_path, 
+    query = "SELECT COUNT(*) as row_count FROM VEG_COMP_LYR_R1_POLY"
+  ) |>
+  pull(row_count)
+  
+  vfi_list <- list()
+  
+  # Ideally we would be able to try all of these variables but we really want AGE.
+  target_variables <-
+    c('PROJ_AGE_1', 
+      'PROJ_AGE_2', 
+      'PROJ_HEIGHT_1',
+      'PROJ_HEIGHT_2',
+      'WHOLE_STEM_BIOMASS_PER_HA',
+      'BRANCH_BIOMASS_PER_HA',
+      'SOIL_MOISTURE_REGIME_1',
+      'SOIL_MOISTURE_REGIME_2',
+      'SOIL_NUTRIENT_REGIME',
+      'HERB_COVER_PCT',
+      'BRYOID_COVER_PCT',
+      'SPECIES_CD_1',
+      'SPECIES_CD_2',
+      'SPECIES_CD_3',
+      'CROWN_CLOSURE',
+      'VERTICAL_COMPLEXITY',
+      'BEC_ZONE_CODE',
+      'BEC_SUBZONE',
+      'Shape')
+  
+  reduced_target_variables <- 
+    c('PROJ_AGE_1',
+      'PROJ_AGE_2',
+      'Shape')
+  
+  while (VFI_ROW_START < veg_count){
+    
+    query <- 
+      glue(
+      "SELECT 
+      {paste0(reduced_target_variables, collapse = ', ')}
+    FROM VEG_COMP_LYR_R1_POLY
+    WHERE PROJ_AGE_1 is not null and PROJ_AGE_2 is not null
+    LIMIT {VFI_CHUNK_SIZE} OFFSET 0"
+      )
+    
+    # TODO: Need to intersection this 
+  
+  vfi_chunk <- 
+    st_read(gdb_path, query = query)
+  
+  vfi_chunk <-
+    vfi_chunk |>
+    st_intersects(
+      chanterelle_observations_buffer |> 
+        summarise(geometry = st_union(geometry)) |>
+        st_transform(st_crs(vfi_chunk))
+      )
+  
+  vfi_list <- append(vfi_list, vfi_chunk)
+  
+  
+  }
+  
+  veg_index <- reduce(vfi_list, bind_rows)
+  
+  veg_index |>
+    st_write(file.path(Sys.getenv('PROJ_DIR'), 'code/202411-chanterelle-map/data/veg_index.shp'))
   
 }
 
@@ -344,11 +393,16 @@ combined_buffer <-
 } else {
   
   combined_buffer <- 
-    read_rds(file.path(Sys.getenv('PROJ_DIR'), 'code/202411-chanterelle-map/data/combined_buffer.rds'))
+    read_rds(file.path(Sys.getenv('PROJ_DIR'), 'code/202411-chanterelle-map/data/combined_buffer.rds')) |>
+    mutate(id = row_number())
   
 }
 
-
+combined_buffer$coordinates <- 
+  combined_buffer |>
+  group_by(id) |>
+  summarise(geometry = st_centroid(geometry)) |>
+  st_coordinates()
 
 chanterelle_df <-
   combined_buffer |> 
@@ -357,7 +411,9 @@ chanterelle_df <-
           join = st_intersects, 
           left = TRUE) |> 
   st_drop_geometry()  |>
-  mutate(is_chanterelle = !is.na(observation_uuid))
+  mutate(is_chanterelle = !is.na(observation_uuid),
+         longitude = coordinates[,1],
+         latitude = coordinates[,2])
 
 set.seed(123)
 
@@ -575,47 +631,27 @@ chanterelle_df |>
   auc_by_group(is_chanterelle, prediction_8, sample)
 
 # There is a big jump in slope for the train AUC and a minor jump in test AUC.
+# We will try out a spline on slope.
+
+chanterelle_model_9 <- gam(is_chanterelle ~ elevation + as.factor(land_cover) + douglas_firs + as.factor(soil_class) + s(slope), data = chanterelle_df |> filter(sample == 'TRAIN'), family = 'binomial')
+
+chanterelle_model_9 |>
+  summary()
+
+chanterelle_df$prediction_9 <- predict(chanterelle_model_9, newdata = chanterelle_df, type = 'response')
+
+chanterelle_df |>
+  auc_by_group(is_chanterelle, prediction_9, sample)
+
+# Adding the spline on slope did not help - for now we will keep slope out of the model as we 
+# do not want the model saying that extreme slope areas are more likely.
+
+# TODO: Apply post modelling scaling on probabilities for elevations above 600 metres
+# !! In our training data, we are missing values for any elevations above 300M - this is
+# due to observations of chanterelles not being in those areas.
 
 stop('TO HERE')
 
-#TODO: Do something with slope to reduce the overfit it introduces
-# Next we try a cut variable on slope.
-
-chanterelle_model_4 <- glm(is_chanterelle ~ elevation + as.factor(land_cover) + douglas_firs + as.factor(soil_class) + slope_cut, data = chanterelle_df |> filter(sample == 'TRAIN'), family = 'binomial')
-
-chanterelle_model_4 |>
-  summary()
-
-chanterelle_df$prediction_4 <- predict(chanterelle_model_4, newdata = chanterelle_df, type = 'response')
-
-chanterelle_df |>
-  auc_by_group(is_chanterelle, prediction_4, sample)
-
-# Trying out aspect
-
-chanterelle_model_5 <- glm(is_chanterelle ~ elevation + as.factor(land_cover) + douglas_firs + as.factor(soil_class) + slope + aspect, data = chanterelle_df |> filter(sample == 'TRAIN'), family = 'binomial')
-
-chanterelle_model_5 |>
-  summary()
-
-chanterelle_df$prediction_5 <- predict(chanterelle_model_5, newdata = chanterelle_df, type = 'response')
-  
-chanterelle_df |>
-  auc_by_group(is_chanterelle, prediction_5, sample)
-
-# We do not believe that a GLM is the best type of model for this. We would ideally
-# like a model that can have non-linear effects. We will try out a gam model first.
-# In particular, slope seems to be non-linear, aspect we would expect to be non-linear.
-
-chanterelle_model_6 <- gam(is_chanterelle ~ s(elevation) + as.factor(land_cover) + douglas_firs + as.factor(soil_class) + slope + s(aspect), data = chanterelle_df |> filter(sample == 'TRAIN'), family = 'binomial')
-
-chanterelle_model_6 |>
-  summary()
-
-chanterelle_df$prediction_6 <- predict(chanterelle_model_6, newdata = chanterelle_df, type = 'response')
-
-chanterelle_df |>
-  auc_by_group(is_chanterelle, prediction_6, sample)
 
 
 #This is to do work on a map of chanterelle locations in BC - the outcome of this will be a
@@ -633,7 +669,7 @@ chanterelle_df |>
 # - A computer vision model for mushroom identification
 # - The ability to save routes and mushroom locations
 # - application to be built using react native most likely with inspiration
-# from gaia gps
+# from gaia gps, ihunter, mushroom maps US
 # - Alerts to users based on weather patterns to go look for their chosen
 # mushrooms based on time of year and weather.
 # - Goal of application - Engage the general population in the study of mushrooms.
